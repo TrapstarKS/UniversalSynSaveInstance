@@ -138,7 +138,7 @@ local function index(self, index_name)
 	return self[index_name]
 end
 
-local cachedPlaceName = USSI.PlaceName
+local cachedPlaceName = USSI.SourcePlaceName
 
 local FULL_VERSION
 
@@ -4461,12 +4461,32 @@ local function synsaveinstance(...)
 			placename = hasExtension and FilePath or (FilePath .. filetype)
 		else
 			if not cachedPlaceName then
-				local ok, info =
-					pcall(service.MarketplaceService.GetProductInfoAsync, service.MarketplaceService, game.PlaceId)
-				if ok then
-					cachedPlaceName = info.Name
-					USSI.PlaceName = cachedPlaceName
+				-- * GetProductInfo returns the name translated to the player's language; use the name in the game's source language
+				local ok, sourceName = pcall(function()
+					local HttpService = service.HttpService
+					local api = "https://gameinternationalization.roblox.com/v1/"
+					local language = HttpService:JSONDecode(
+						game:HttpGet(api .. "source-language/games/" .. game.GameId, true)
+					).languageCode
+					local names = HttpService:JSONDecode(
+						game:HttpGet(api .. "name-description/games/" .. game.GameId, true)
+					).data
+					for _, entry in names do
+						if entry.languageCode == language then
+							return entry.name
+						end
+					end
+				end)
+				if ok and type(sourceName) == "string" and sourceName ~= "" then
+					cachedPlaceName = sourceName
+				else
+					local okInfo, info =
+						pcall(service.MarketplaceService.GetProductInfoAsync, service.MarketplaceService, game.PlaceId)
+					if okInfo then
+						cachedPlaceName = info.Name
+					end
 				end
+				USSI.SourcePlaceName = cachedPlaceName
 			end
 
 			local PlaceName = cachedPlaceName and (game.PlaceId .. " " .. cachedPlaceName) or game.PlaceId
