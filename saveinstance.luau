@@ -4335,7 +4335,8 @@ local function synsaveinstance(...)
 	end
 
 	local function sanitizeFileName(str)
-		return string.sub(string.gsub(string.gsub(string.gsub(str, "[^%w _]", ""), " +", " "), " +$", ""), 1, 240)
+		local cleaned = string.gsub(string.gsub(string.gsub(str, "[^%w _]", ""), "^[ _]+", ""), "[ _]+$", "")
+		return string.sub((string.gsub(cleaned, "[ _]+", "_")), 1, 240)
 	end
 
 	local EXEC_STATE_FILE = USSI_FOLDER .. "EXEC_STATE.json"
