@@ -3669,6 +3669,7 @@ end
 --- @field BytecodeTimeout number -- How many seconds a `getscriptbytecode` call can take. If it takes longer, the script stops waiting and skips the bytecode for that script. Set to -1 to disable the timeout. ___Default:___ 3
 --- @field DecompileIgnore {Instance | string} | {[Instance | string]: boolean | {[string]: boolean}} -- Skip decompiling matched [Instance]s and their children. `Source` becomes a short ignored message. You can pass an [Instance], a class name, or `ClassName = {Name1, Name2}`. Set an [Instance] to `false` to skip only that instance, not its children. ___Default:___ {TextChatService}
 --- @field SourceCache {[Instance]: string} | false -- Source text to use for these scripts as-is instead of decompiling them. ___Default:___ false
+--- @field DecompileThreads number -- Before saving, decompile every script up front with this many threads at once. Scripts with the same bytecode are decompiled once. Set to 1 to decompile one at a time. ___Default:___ 6
 --- @field DecompileJobless boolean -- Only use scripts that are already in the decompile cache. Missing scripts get a short not-found message. This turns on `scriptcache`. ___Default:___ false
 --- @field scriptcache boolean -- If the executor supports `getscriptbytecode`, cache decompiled code. This avoids decompiling the same script twice. The cache stays after the script reloads. ___Default:___ true
 --- @field RecoverScriptsFromAssets boolean -- Recover the original `Source` of scripts that were published as assets. Changes made after publishing are not included. ___Default:___ true
@@ -3829,6 +3830,7 @@ local function synsaveinstance(...)
 		CompressionLevel = 9,
 		Decompile = true,
 		DecompileTimeout = 10,
+		DecompileThreads = 6,
 		DecompileJobless = false,
 		RecoverScriptsFromAssets = true,
 		-- decomptype = "",
@@ -4786,14 +4788,156 @@ local function synsaveinstance(...)
 		end
 	end
 
+	local prefetchedSources = {}
+	local prefetchDecompile
+
+	local function formatDecompiled(ok, result)
+		if not result then
+			ok, result = false, "Empty Output"
+		end
+		if ok then
+			return (string.gsub(result, "\0", "\\0")) -- ? Some decompilers sadly output \0 which prevents files from opening
+		end
+		return "--[[ Failed to decompile. Reason:\n" .. (result or "") .. "\n]]"
+	end
+
+	local function isServerOnlyScript(instance)
+		local isLocalScript = instance:IsA("LocalScript")
+		return isLocalScript and instance.RunContext == Enum.RunContext.Server
+			or not isLocalScript and instance:IsA("Script") and instance.RunContext ~= Enum.RunContext.Client
+	end
+
 	if not OPTIONS.Decompile then
 		ldecompile = function()
 			return "-- Decompiling is disabled"
 		end
 	elseif decompile then
 		local decomp = makeTimeoutHandler(OPTIONS.DecompileTimeout, decompile, "Decompiler timed out")
+		local decompileTimeout = OPTIONS.DecompileTimeout
+
+		-- * Unlike makeTimeoutHandler this is safe to run from many threads at once
+		local function decompileConcurrently(script)
+			local finished, ok, result = false, nil, nil
+			task.spawn(function()
+				ok, result = pcall(decompile, script)
+				finished = true
+			end)
+			local started = os.clock()
+			while not finished do
+				if decompileTimeout >= 0 and os.clock() - started >= decompileTimeout then
+					return nil, "Decompiler timed out"
+				end
+				task.wait()
+			end
+			return ok, result
+		end
+
+		prefetchDecompile = function(entries, ordered)
+			if DecompileJobless then
+				return
+			end
+
+			local groups, order = {}, {}
+			for _, instance in ordered do
+				local entry = entries[instance]
+				if
+					entry
+					and not entry.virtual
+					and typeof(instance) == "Instance"
+					and not decompileIgnoreMap[instance]
+					and not (SourceCache and SourceCache[instance])
+					and isLuaSourceContainer(instance)
+					and not isServerOnlyScript(instance)
+				then
+					local key = instance
+					if ScriptCache then
+						local s, bytecode = getbytecode(instance)
+						if s then
+							if not bytecode or bytecode == "" or ldeccache[bytecode] then
+								key = nil -- ldecompile already answers these without decompiling
+							else
+								key = bytecode
+							end
+						end
+					end
+					if key then
+						local group = groups[key]
+						if not group then
+							group = {}
+							groups[key] = group
+							order[#order + 1] = key
+						end
+						group[#group + 1] = instance
+					end
+				end
+				yieldIfDue()
+			end
+
+			local total = #order
+			if total == 0 then
+				return
+			end
+
+			local threads = math.clamp(math.floor(tonumber(OPTIONS.DecompileThreads) or 1), 1, 32)
+			if threads > total then
+				threads = total
+			end
+
+			local nextIndex, done, running = 0, 0, threads
+			local function worker()
+				while true do
+					nextIndex += 1
+					local index = nextIndex
+					if index > total then
+						break
+					end
+					local key = order[index]
+					local group = groups[key]
+					local ok, result = decompileConcurrently(group[1])
+					if ok == false then
+						ok, result = decompileConcurrently(group[1])
+					end
+					local output = formatDecompiled(ok, result)
+					if ScriptCache and type(key) == "string" then
+						ldeccache[key] = output
+					end
+					for _, script in group do
+						prefetchedSources[script] = output
+					end
+					done += 1
+					if StatusText then
+						StatusText.Text = "Decompiling " .. done .. "/" .. total .. " scripts"
+					end
+				end
+			end
+
+			if StatusText then
+				StatusText.Text = "Decompiling 0/" .. total .. " scripts"
+			end
+			local started = os.clock()
+			for _ = 1, threads do
+				task.spawn(function()
+					pcall(worker)
+					running -= 1
+				end)
+			end
+			while running > 0 do
+				task.wait()
+			end
+			lastYield = os.clock()
+
+			if __DEBUG_MODE then
+				__DEBUG_MODE(
+					string.format("Decompiled %d unique scripts with %d threads in %.2fs", total, threads, os.clock() - started)
+				)
+			end
+		end
 
 		ldecompile = function(script)
+			local prefetched = prefetchedSources[script]
+			if prefetched then
+				return prefetched
+			end
 			-- local name = scr.ClassName .. scr.Name
 			local bytecode
 			if ScriptCache then
@@ -4826,18 +4970,7 @@ local function synsaveinstance(...)
 				-- task.wait() -- TODO Maybe remove?
 			end
 
-			local ok, result = run_with_loading("Decompiling " .. script.Name, true, nil, decomp, script)
-			if not result then
-				ok, result = false, "Empty Output"
-			end
-
-			local output
-			if ok then
-				result = string.gsub(result, "\0", "\\0") -- ? Some decompilers sadly output \0 which prevents files from opening
-				output = result
-			else
-				output = "--[[ Failed to decompile. Reason:\n" .. (result or "") .. "\n]]"
-			end
+			local output = formatDecompiled(run_with_loading("Decompiling " .. script.Name, true, nil, decomp, script))
 
 			if ScriptCache and bytecode then -- TODO there might(?) be an edgecase where it manages to decompile (built-in) even though getscriptbytecode failed, and the output won't get cached
 				ldeccache[bytecode] = output -- ? Should we cache even if it timed out?
@@ -6314,6 +6447,10 @@ local function synsaveinstance(...)
 		end
 
 		local ctx = collect(allRoots)
+
+		if prefetchDecompile then
+			prefetchDecompile(ctx.entries, ctx.ordered)
+		end
 
 		-- collect filtered and deduped; recover each extra's surviving roots.
 		for _, extra in pendingExtras do
